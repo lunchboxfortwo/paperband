@@ -1,98 +1,332 @@
-const DOC_MD = "docs/paper-trader-monthly-momentum-s1.md";
-const DOC_PDF = "docs/paper-trader-monthly-momentum-s1.pdf";
+import { createChart } from "./chart.js";
+import {
+  PNL_BASIS_TEXT,
+  STRATEGY_ID,
+  actionLine,
+  buildDisplay,
+  formatEt,
+  formatMoney,
+  marksNote,
+  statusLine,
+} from "./view-model.js";
 
-function text(id, value) {
-  const node = document.querySelector(id);
-  if (node) node.textContent = value;
-}
+const balanceChart = createChart(document.querySelector("#balance"));
+const priceChart = createChart(document.querySelector("#price"));
+let model = null;
+let selected = null;
 
-function metric(label, value) {
-  const node = document.createElement("article");
-  node.className = "metric";
-  const name = document.createElement("p");
-  name.className = "label";
-  name.textContent = label;
-  const strong = document.createElement("strong");
-  strong.textContent = value;
-  node.append(name, strong);
+function para(text, className) {
+  const node = document.createElement("p");
+  if (className) node.className = className;
+  node.textContent = text;
   return node;
 }
 
-export function renderPublication(body) {
-  const publication = body?.publication || {};
-  const snapshot = body?.snapshot;
-  const lines = [publication.market_note || "No paper snapshot has been published."];
-  if (publication.publication_state === "stale") {
-    lines.unshift("STALE. The publisher has not delivered a new snapshot.");
+function render(next) {
+  model = next;
+  const status = document.querySelector("#status");
+  if (!model.ok) {
+    status.textContent = model.message;
+    document.querySelector("#equity").replaceChildren();
+    balanceChart.setSpec({ state: "empty", message: "No balance marks were read." });
+    priceChart.setSpec({ state: "empty", message: "No price series was read." });
+    document.querySelector("#tracked").replaceChildren(para("No tracked names were read."));
+    document.querySelector("#actions").replaceChildren(para("No paper actions were read."));
+    return;
   }
-  if (publication.published_at) lines.push("Published " + publication.published_at + ".");
-  const market = snapshot?.market?.status;
-  if (market && market !== "open") lines.push("Market status: " + market + ". Not a live quote.");
-  return lines.join(" ");
+
+  status.textContent = statusLine(model);
+  renderEquity(model);
+  renderBalance(model);
+  const strategy = document.querySelector("#strategy");
+  if (model.algorithmId && model.algorithmId !== STRATEGY_ID && strategy.dataset.fallback !== "1") {
+    strategy.textContent = "This snapshot is not the monthly momentum rule. See the full note.";
+    strategy.dataset.fallback = "1";
+  }
+  renderTracked(model);
+  renderActions(model);
+  renderSwitcher();
+  renderPrice();
 }
 
-async function loadSnapshot() {
-  const metrics = document.querySelector("#metrics");
-  try {
-    const response = await fetch("data/snapshot.json", { cache: "no-store" });
-    if (!response.ok) throw new Error("HTTP " + response.status);
-    const raw = await response.json();
-    const body = raw.snapshot ? raw : { publication: { market_note: raw.disclaimer, published_at: raw.generated_at_et }, snapshot: raw };
-    text("#publication", renderPublication(body));
-    metrics.replaceChildren();
-    const book = body.snapshot && body.snapshot.book;
-    if (!book) return;
-    const equity = book.equity == null ? "unknown" : "$" + Number(book.equity).toFixed(2);
-    metrics.append(
-      metric("Paper equity", equity),
-      metric("Cash", "$" + Number(book.cash).toFixed(2)),
-      metric("Session", book.session_date || "none"),
-    );
-    const symbols = document.querySelector("#symbols");
-    if (symbols) {
-      symbols.replaceChildren();
-      for (const row of body.snapshot.symbols || []) {
-        const item = document.createElement("li");
-        const close = row.last_close == null ? "" : " mark " + row.last_close;
-        item.textContent = (row.symbol || "") + " " + (row.tsmom_target_label || row.direction || "") + close;
-        symbols.append(item);
-      }
+function renderEquity(current) {
+  const host = document.querySelector("#equity");
+  host.replaceChildren();
+  const book = current.book;
+  const state = book.halted ? "Halted" : book.positionCount ? `${book.positionCount} open` : "Flat";
+  host.append(
+    stat("Equity", formatMoney(book.equity) || "Unknown"),
+    stat("Cash", formatMoney(book.cash) || "Unknown"),
+    stat("Book", state),
+  );
+}
+
+function stat(label, value) {
+  const wrap = document.createElement("div");
+  const name = document.createElement("p");
+  name.className = "k";
+  name.textContent = label;
+  const number = document.createElement("p");
+  number.className = "v";
+  number.textContent = value;
+  wrap.append(name, number);
+  return wrap;
+}
+
+function renderBalance(current) {
+  if (!current.balance.length) {
+    balanceChart.setSpec({ state: "empty", message: "No balance marks in this snapshot." });
+    return;
+  }
+  if (current.balance.length === 1) {
+    const point = current.balance[0];
+    const when = formatEt(point.ts);
+    const kind = point.kind || "mark";
+    balanceChart.setSpec({
+      state: "single",
+      title: formatMoney(point.equity) || "Unknown",
+      detail: [when, kind].filter(Boolean).join(" · "),
+      note: "Only published mark.",
+      aria: `Balance ${formatMoney(point.equity) || "unknown"}, ${kind}${when ? `, ${when}` : ""}. Only published mark.`,
+    });
+    return;
+  }
+  balanceChart.setSpec({
+    state: "series",
+    valueLabel: "Equity",
+    caption: "Published equity marks.",
+    aria: `Balance, ${current.balance.length} published marks.`,
+    markers: [],
+    points: current.balance.map((point) => ({
+      value: point.equity,
+      low: point.equity,
+      high: point.equity,
+      label: formatEt(point.ts) || "Unspecified time",
+      axis: formatEt(point.ts, "short") || "",
+    })),
+  });
+}
+
+function renderSwitcher() {
+  const host = document.querySelector("#symbols");
+  host.replaceChildren();
+  if (!selected || !model.symbols.some((row) => row.symbol === selected)) {
+    selected = model.symbols[0]?.symbol || null;
+  }
+  for (const row of model.symbols) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = row.symbol;
+    button.setAttribute("aria-pressed", String(row.symbol === selected));
+    button.addEventListener("click", () => {
+      selected = row.symbol;
+      renderSwitcher();
+      renderPrice();
+    });
+    host.append(button);
+  }
+}
+
+function renderPrice() {
+  const row = model.symbols.find((item) => item.symbol === selected);
+  if (!row) {
+    priceChart.setSpec({ state: "empty", message: "No tracked names in this snapshot." });
+    return;
+  }
+  if (!row.bars.length) {
+    priceChart.setSpec({ state: "empty", message: row.caption });
+    return;
+  }
+  priceChart.setSpec({
+    state: "series",
+    valueLabel: "Close",
+    caption: row.caption,
+    aria: `${row.symbol} daily closes, ${row.bars[0].date} to ${row.bars[row.bars.length - 1].date}.`,
+    markers: row.markers,
+    points: row.bars.map((bar) => ({
+      date: bar.date,
+      value: bar.close,
+      low: bar.low,
+      high: bar.high,
+    })),
+  });
+}
+
+function renderTracked(current) {
+  const host = document.querySelector("#tracked");
+  host.replaceChildren();
+  if (!current.symbols.length) {
+    host.append(para("No tracked names in this snapshot."));
+    return;
+  }
+
+  const table = document.createElement("table");
+  const columns = document.createElement("colgroup");
+  for (const width of ["18%", "34%", "28%", "20%"]) {
+    const col = document.createElement("col");
+    col.style.width = width;
+    columns.append(col);
+  }
+  table.append(columns);
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headRow.append(cell("th", "Name"), cell("th", "Target"), cell("th", "Mark", "num"));
+  const pnlHead = cell("th", "P&L", "num");
+  const basis = document.createElement("button");
+  basis.type = "button";
+  basis.className = "hint";
+  basis.textContent = "basis";
+  basis.setAttribute("aria-expanded", "false");
+  const pop = document.createElement("p");
+  pop.className = "caption basis";
+  pop.hidden = true;
+  pop.textContent = basisText(current);
+  let pinned = false;
+  function show(next) {
+    pop.hidden = !next;
+    basis.setAttribute("aria-expanded", String(next));
+  }
+  basis.addEventListener("click", () => {
+    pinned = !pinned;
+    show(pinned);
+  });
+  basis.addEventListener("pointerenter", (event) => {
+    if (event.pointerType === "mouse") show(true);
+  });
+  basis.addEventListener("pointerleave", (event) => {
+    if (event.pointerType === "mouse" && !pinned) show(false);
+  });
+  basis.addEventListener("focus", () => show(true));
+  basis.addEventListener("blur", () => {
+    if (!pinned) show(false);
+  });
+  pnlHead.append(basis);
+  headRow.append(pnlHead);
+  head.append(headRow);
+  table.append(head);
+
+  const body = document.createElement("tbody");
+  for (const row of current.symbols) {
+    const tr = document.createElement("tr");
+    tr.append(cell("td", row.symbol));
+    tr.append(targetCell(row));
+    const mark = document.createElement("td");
+    mark.className = "num";
+    mark.textContent = formatMoney(row.mark) || "—";
+    const shortMark = formatEt(row.markUtc, "short");
+    if (shortMark) {
+      const when = document.createElement("span");
+      when.className = "quiet block";
+      when.textContent = shortMark;
+      mark.append(when);
     }
-  } catch (error) {
-    text("#publication", "The published snapshot could not be read. No prices were estimated.");
-  }
-}
-
-async function loadNote() {
-  const doc = document.querySelector("#strategy-doc");
-  try {
-    const response = await fetch(DOC_MD, { cache: "no-store" });
-    if (!response.ok || !window.PaperbandMarkdown) throw new Error("missing");
-    doc.innerHTML = window.PaperbandMarkdown.render(await response.text());
-  } catch (error) {
-    doc.textContent = "The strategy note is not on this site yet.";
-  }
-}
-
-async function loadPdf() {
-  const status = document.querySelector("#pdf-status");
-  const link = document.querySelector("#pdf-link");
-  try {
-    const response = await fetch(DOC_PDF, { method: "HEAD", cache: "no-store" });
-    const ready = response.ok && (response.headers.get("content-type") || "").includes("application/pdf");
-    status.textContent = ready
-      ? "The sanctioned PDF is on this site."
-      : "The sanctioned PDF is not on this site yet.";
-    if (!ready && link) {
-      link.setAttribute("aria-disabled", "true");
-      link.removeAttribute("href");
+    tr.append(mark);
+    const pnl = document.createElement("td");
+    pnl.className = "num";
+    if (row.pnlPct == null) {
+      pnl.textContent = "none";
+      pnl.setAttribute("aria-label", `No booked paper P&L for ${row.symbol}`);
+    } else {
+      pnl.textContent = formatPctSafe(row.pnlPct);
+      pnl.classList.add(row.pnlPct > 0 ? "long" : row.pnlPct < 0 ? "short" : "flat");
     }
-  } catch (error) {
-    status.textContent = "The PDF could not be checked.";
+    tr.append(pnl);
+    body.append(tr);
+  }
+  table.append(body);
+  host.append(table, pop);
+  const note = marksNote(current.symbols);
+  if (note) host.append(para(note, "caption"));
+}
+
+function basisText(current) {
+  const published = current.symbols.find((row) => row.pnlPct != null);
+  if (!published) return PNL_BASIS_TEXT;
+  return published.pnlBasis || "Published percent. This snapshot did not name the denominator.";
+}
+
+function targetCell(row) {
+  const td = document.createElement("td");
+  if (!row.target) {
+    td.textContent = "—";
+    return td;
+  }
+  const side = document.createElement("span");
+  side.className = `side ${row.target}`;
+  side.textContent = row.target.charAt(0).toUpperCase() + row.target.slice(1);
+  td.append(side);
+  if (row.pending) {
+    const pending = document.createElement("span");
+    pending.className = "quiet";
+    pending.textContent = ", pending";
+    td.append(pending);
+  }
+  return td;
+}
+
+function cell(tag, text, className) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (tag === "th") node.scope = "col";
+  node.textContent = text;
+  return node;
+}
+
+function formatPctSafe(value) {
+  const pct = value * 100;
+  const body = Math.abs(pct).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (pct > 0) return `+${body}%`;
+  if (pct < 0) return `-${body}%`;
+  return `${body}%`;
+}
+
+function renderActions(current) {
+  const host = document.querySelector("#actions");
+  host.replaceChildren();
+  if (!current.actions.length) {
+    host.append(para("No paper actions in this snapshot."));
+    return;
+  }
+  if (!current.fills) host.append(para("No fills.", "quiet"));
+  if (current.actions.some((action) => action.status === "pending")) {
+    host.append(para("Pending, not executed.", "quiet"));
+  }
+  const list = document.createElement("ul");
+  list.className = "actions";
+  const ordered = [
+    ...current.actions.filter((action) => action.status === "filled"),
+    ...current.actions.filter((action) => action.status !== "filled"),
+  ];
+  for (const action of ordered) {
+    const item = document.createElement("li");
+    item.textContent = actionLine(action);
+    list.append(item);
+  }
+  host.append(list);
+}
+
+async function loadJson(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${url} ${response.status}`);
+  return response.json();
+}
+
+async function load() {
+  try {
+    const snapshot = await loadJson("data/snapshot.json");
+    let prices = null;
+    try {
+      prices = await loadJson("data/prices.json");
+    } catch {
+      prices = null;
+    }
+    render(buildDisplay(snapshot, prices));
+  } catch {
+    document.querySelector("#status").textContent = "The snapshot could not be read. Nothing was estimated.";
   }
 }
 
-loadSnapshot();
-loadNote();
-loadPdf();
-setInterval(loadSnapshot, 60000);
+load();
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") load();
+});
